@@ -1,0 +1,95 @@
+
+NOTES ON SEASTAR
+=================
+
+include/seastar/core/reactor.hpp
+    seems to be the main thing, where all the foo is controlled.
+
+From the tutorial we get to play, initially, with timers. These examples focus
+on getting us to get a broader view of parallelism with futures.
+
+The problem, IMO, with these examples, is that you need to take them at face
+value. Yes, you run those examples and you get things happening; we are told
+those multiple timers are happening in parallel; it seems that way; but how,
+and why?
+
+Digging deeper into the called classes, we go through the `sleep.hh` header;
+here we find that the `sleep()` function relies on a `timer` class, which will
+work with `std::chrono::steady_timer` (just a monotonic clock, nothing
+particularly relevant). The `timer` class, by itself, is nothing amazing, but
+there is this one function, called from `sleep()` which is: `timer.arm()`.
+
+Diving into `timer.hh`, we find that this function is actually defined
+somewhere else, and that place is in `src/core/reactor.cc`. It seems that it's
+in `reactor.cc` that most of the fun is happening.
+
+In `timer<Clock>::arm()`'s definition, we can see that we are arming the timer
+(which is basically saying that we started it, etc.), and then we call
+`engine().add_timer(this)` -- and this is the interesting bit! At least it seems
+that we are getting somewhere that actually tracks these things!
+
+And right enough, `engine()` is a function defined at `core/reactor.hh`,
+which returns a `reactor` class.
+
+In its stead, `add_timer()`, defined in `src/core/reactor.cc`, will queue the
+timer on a `timer_set` class, which is essentially a list of timers, defined
+in `core/timer-set.hh`.
+
+Now we know where these things go, where they are kept. The question that
+remains is how we get all this running.
+
+During the tutorial we are told that we shall first create a
+`seastar::app_template`, which will start the main event loop (i.e., the
+`seastar engine`), on one or more CPUs. We now know this `engine` is the
+`reactor` class, but it still begs the question of how we get there.
+
+
+.. code-block:: cpp
+    :linenos:
+
+        int main(int argc, char *argv[])
+        {
+            seastar::app_template app;
+            app.run(argc, argv, [] {
+                        std::cout << "hello world" << std::endl;
+                        return seastar::make_ready_future<>();
+                    }
+            );
+            return 0;
+        }
+
+
+It's that tidbit, on line 3, that is supposed to run the a function (in this
+case, a lambda), on the engine. At this point, we are not sure how this is
+going to run on multiple cores, but we are told that this is not supposed to
+be running in parallel anyway (other examples, later in time, will show
+parallel calls). What we do know, is that we are calling `app_template::run()`
+and we want to understand what is happening there.
+
+The truly annoying thig is that `class app_template` itself does not initiate
+`class reactor`; it simply uses it during `app_template::run()` (via the
+`engine()` static function), and that's pretty much it.
+
+Taking a closer look, however, shows a fudgy, somewhat obscure-ish nuance:
+the `run()` function is actually returning the result of a call to
+`app_template::run_deprecated()` (what's up with that name is beyond me), and
+it's in this function that we will run the function passed to `run()`.
+Somewhere in this function we are calling `smp::configure()`, which will
+indeed *initialize seastar*.
+
+Now, `class smp` is basically a collection of `static` functions and member
+variables. Within it we have this one vector of reactors, `static
+std::vector<reactor*> _reactors`. This vector will be sized according to the
+number of available CPUs, and each position will be populated by and a reactor
+class. This is achieved by running a loop (for each CPU), allocating an engine
+(via `smp::allocate_reactor()`), and populating a position in the vector. Each
+reactor will be configured (`reactor::configure()`), and run
+(`reactor::run()`).
+
+At last, `app_template::run_deprecated()` will run the provided function. This
+bit leaves us confused, as we are not entirely sure what kind of c++ foo is
+happening that allows the function to run, but somehow the `func.get()` in one
+of the `then(...)` continuations for the engine will get the function in the
+engine's task queue, which will (likelly) be handled during the call to
+`engine().run()`.
+
