@@ -2,11 +2,23 @@
 NOTES ON SEASTAR
 =================
 
+.. note::
+    We are trying to follow the tutorial's form, although providing whatever
+    additional insights we may have found useful while going through it. A lot
+    (if not all?) of the example code is likely grabbed directly (either in
+    its original form or slightly adapted) from the tutorial.
+
+
+---------------
+Inner workings
+---------------
+
 include/seastar/core/reactor.hpp
     seems to be the main thing, where all the foo is controlled.
 
-From the tutorial we get to play, initially, with timers. These examples focus
-on getting us to get a broader view of parallelism with futures.
+
+From the tutorial [#]_ we get to play, initially, with timers. These examples
+focus on getting us to get a broader view of parallelism with futures.
 
 The problem, IMO, with these examples, is that you need to take them at face
 value. Yes, you run those examples and you get things happening; we are told
@@ -47,8 +59,7 @@ During the tutorial we are told that we shall first create a
 .. code-block:: cpp
     :linenos:
 
-        int main(int argc, char *argv[])
-        {
+        int main(int argc, char *argv[]) {
             seastar::app_template app;
             app.run(argc, argv, [] {
                         std::cout << "hello world" << std::endl;
@@ -93,3 +104,163 @@ of the `then(...)` continuations for the engine will get the function in the
 engine's task queue, which will (likelly) be handled during the call to
 `engine().run()`.
 
+
+-----------------------------
+On Futures and Continuations
+-----------------------------
+
+As we understand, the concept of a `future` is something that will run and
+return a value, we just have no idea when that value will be available.
+Nonetheless, our execution will continue without blocking waiting for said
+value; that is, until we actually *need* that value, at which time we will
+request that value, and wait for it.
+
+A very simple example that comes into mind is how we write things on disk on
+the monitors. On `Paxos::begin()` one can see that the leader will first
+commit the paxos transaction to disk, and only then send it to the peons,
+asking them to commit the transaction to disk. We could, instead, rely on a
+future: the disk write would be encapsulated in a future, which would return
+immediately, and we could move on to sending the `OP_BEGIN` to the peons. This
+would not break the algorithm because we would wait for the future's
+completion before sending `COMMIT` messages (as well as ensuring we've got all
+the `ACCEPT` from a majority of quorum. This may not be a huge performance
+improvement, but we would not have to wait for disk I/O which, for larger
+writes (e.g., osdmaps), may take longer than the network communication
+(although the peons will have to wait for their writes before replying with
+the `ACCEPT` message, but we may still end up writing the leader's data in
+parallel with the peons; and release the leader to keep doing other things in
+the mean time).
+
+Now, that is a future. A continuation is something that is chained to the
+completion of a future. E.g.,
+
+
+.. code-block:: cpp
+    :linenos:
+
+        #include <seastar/core/sleep.hh>
+        #include <iostream>
+
+        seastar::future<int> slow() {
+            using namespace std::chrono_literals;
+            return seastar::sleep(100ms).then([] { return 3; });
+        }
+
+        seastar::future<> f() {
+            return slow().then([] (int val) {
+                std::cout << "got " << val << std::endl;
+            });
+        }
+
+
+Taking a look at `f()`, we see that we are calling `slow()`, which will
+explicitely return an integer future. Given a future is being returned, we can
+simply move on, because we know that whatever is being run will be available
+at a later time. This call, however, is chained to a continuation that will
+print `got <int>`. Once the `slow()` future returns, we run this continuation,
+which will receive an integer as an argument and print `got 3`.
+
+Given how we have chained these futures, we can also write function `f()` as
+
+
+.. code-block:: cpp
+    :linenos:
+
+        seastar::future<> f() {
+            using namespace std::chrono_literals;
+            return seastar::sleep(100ms).then([] {
+                return 3;
+            }).then([] (int val) {
+                std::cout << "got " << val << std::endl;
+            });
+        }
+
+
+Following the tutorial, we are now presented with a `ready future`. This seems
+as an optimization, to instruct make its return immediately available. We are
+told that most continuations are executed sequentially, without having to wait
+in the event loop, although we assume that this is for those that are simple
+and fast enough to execute, that by the time the next continuation is handled
+the value of the previous future is already available. However, we are also
+told that there is a limit on those, so that the event loop (the `engine
+run()` function we talked about before) is not starved; hence it may be
+desirable to call on `seastar::make_ready_future()` to make it clear that our
+value is ready to be consumed by the next continuation.
+
+
+-------------------
+Exception Handling
+-------------------
+
+The framework will mimic its exception handling to what would be expected from
+a sequential execution thread, even though it may happen within chained
+futures/continuations. E.g., for an exception thrown in the code below, the
+call to `line4()` will be skipped, much like if we were executing `line4()`
+after `line2()` that may have thrown an unhandled exception.
+
+.. code-block:: cpp
+    :linenos:
+
+    return line1().then([] {
+        return line2(); // throws
+    }).then([] {
+        return line4(); // skipped
+    });
+
+
+However, for this to work so seastar is able to handle the exception, it
+requires the exceptions to be thrown using an `exception future`; otherwise,
+it won't be able to automatically deal with `std::exception`. For instance,
+futures can have, aside from `then()` continuations, a `finally()`
+continuation; the latter is executed whenever the chained futures finish,
+regardless of whether an exception has been thrown or not (usually good to
+clean up resources). However, we will only reach it if we are handling a
+seastar-recognizable exception; otherwise, `finally()` is not called. E.g.,
+
+
+.. code-block:: cpp
+    :linenos:
+
+    seastar::future<> fail_exception_future() {
+        return seastar::make_exception_future<>(whatever_exception());
+    }
+
+    seastar::future<> fail_boom() {
+        throw std::exception("boom");
+        return seastar::make_ready_future<>();
+    }
+
+    seastar::future<> fail_wrapped_boom() {
+        try {
+            fail_boom();
+        } catch (...) {
+            return seastar::make_exception_future(std::current_exception());
+        }
+        return seastar::make_ready_future<>();
+    }
+
+    seastar::future<> f_1() {
+        return fail_exception_future().finally([] {
+            std::cout << "clean up" << std::endl;
+        });
+    }
+
+    seastar::future<> f_2() {
+        return fail_boom().finally([] {
+            std::cout << "this is not executed" << std::endl;
+        });
+    }
+
+    seastar::future<> f_3() {
+        return fail_wrapped_boom().finally([] {
+            std::cout << "boomed, but we got here" << std::endl;
+        });
+    }
+
+
+In these examples, only `f_2()` will kill the engine before running its
+`finally()` continuation. The engine will always fail, mind you, but that is
+because the future exception is not being handled.
+
+
+.. [#] https://github.com/scylladb/seastar/blob/master/doc/tutorial.md
